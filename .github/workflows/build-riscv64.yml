@@ -1,0 +1,267 @@
+name: Build n8n for RISC-V 64
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # daily at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild even if release exists'
+        type: boolean
+        default: false
+      version:
+        description: 'Override version (e.g. 2.46.7). Leave empty for latest.'
+        type: string
+        default: ''
+      runner:
+        description: 'Runner label for the build job (a self-hosted riscv64 label builds natively)'
+        type: string
+        default: 'ubuntu-latest'
+
+env:
+  IMAGE_NAME: n8n
+  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_USERNAME }}/n8n-riscv64
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      node_version: ${{ steps.resolve.outputs.node_version }}
+      node_major: ${{ steps.resolve.outputs.node_major }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Resolve version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # The npm package is what the image installs, so npm's `latest` is the source of truth
+          # (GitHub's "latest release" can point at a different release line).
+          if [[ -n "$INPUT_VERSION" ]]; then
+            VERSION="${INPUT_VERSION#n8n@}"
+          else
+            VERSION=$(curl -sfL --retry 3 https://registry.npmjs.org/n8n/latest | jq -r '.version')
+          fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: bad n8n version '${VERSION}'"; exit 1; }
+
+          # Node major comes from the package's own engines field
+          ENGINES=$(curl -sfL --retry 3 "https://registry.npmjs.org/n8n/${VERSION}" | jq -r '.engines.node')
+          MAJOR=$(echo "$ENGINES" | grep -oE '[0-9]+' | head -n1)
+          [[ -n "$MAJOR" ]] || { echo "ERROR: cannot read Node major from engines '${ENGINES}'"; exit 1; }
+
+          # docker.io/node has no riscv64 variant; unofficial-builds does. Index is newest first.
+          NODE=$(curl -sfL --retry 3 https://unofficial-builds.nodejs.org/download/release/index.json \
+            | jq -r --arg m "v${MAJOR}." \
+              '[.[] | select(.files | index("linux-riscv64")) | select(.version | startswith($m))][0].version')
+          NODE="${NODE#v}"
+          [[ -n "$NODE" && "$NODE" != "null" ]] || { echo "ERROR: no riscv64 Node ${MAJOR}.x build found"; exit 1; }
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "node_version=${NODE}" >> "$GITHUB_OUTPUT"
+          echo "node_major=${MAJOR}" >> "$GITHUB_OUTPUT"
+          echo "Resolved n8n ${VERSION} (engines ${ENGINES}), Node ${NODE}"
+
+      - name: Check if already built
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+          FORCE="${{ inputs.force }}"
+
+          if [[ "$FORCE" == "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Force build requested"
+            exit 0
+          fi
+
+          EXISTING=$(gh release view "${VERSION}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --json tagName -q '.tagName' 2>/dev/null || echo "")
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${VERSION}-riscv64 already exists, skipping"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "No release for ${VERSION}-riscv64, will build"
+          fi
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 360
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+      NODE_VERSION: ${{ needs.detect.outputs.node_version }}
+      NODE_MAJOR: ${{ needs.detect.outputs.node_major }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The npm install (native addon compile) runs as riscv64 code, so it needs emulation
+      # unless the job already runs on a riscv64 machine.
+      - name: Set up QEMU
+        if: runner.arch != 'RISCV64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/riscv64
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64
+          build-args: |
+            N8N_VERSION=${{ env.VERSION }}
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            NODE_MAJOR=${{ env.NODE_MAJOR }}
+          cache-from: type=gha,scope=n8n
+          cache-to: type=gha,mode=max,scope=n8n
+
+      # Node 24's V8 can crash under qemu-user (QEMU 11.1.2: its Sparkplug baseline compiler
+      # segfaults, `node -e 1` dies). Probe which flags the emulator needs and run every Node
+      # process of the tests through a wrapper that adds them. --jitless is the last resort and
+      # also disables WebAssembly, which n8n needs at startup, so the start tests are skipped then.
+      - name: Probe Node under emulation
+        id: probe
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64"
+          FLAGS=""
+          for candidate in "" "--no-sparkplug" "--jitless"; do
+            if docker run --rm --platform linux/riscv64 --entrypoint node "$IMG" $candidate \
+                -e 'let s = 0; for (let i = 0; i < 3e6; i++) s += i % 7; process.exit(s > 0 ? 0 : 1)'; then
+              FLAGS="$candidate"
+              break
+            fi
+          done
+          [[ -n "$FLAGS" ]] && echo "::warning::Node needs '${FLAGS}' under this emulator"
+
+          mkdir -p "$RUNNER_TEMP/wrap"
+          printf '#!/bin/sh\nexec /usr/local/bin/node %s "$@"\n' "$FLAGS" > "$RUNNER_TEMP/wrap/node"
+          chmod +x "$RUNNER_TEMP/wrap/node"
+          echo "flags=${FLAGS}" >> "$GITHUB_OUTPUT"
+          echo "start_tests=$([[ "$FLAGS" == "--jitless" ]] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (image contents)
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64"
+          RUN=(docker run --rm --platform linux/riscv64 -v "$RUNNER_TEMP/wrap:/wrap:ro"
+               -e "PATH=/wrap:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+          docker inspect "$IMG" --format '{{.Architecture}}' | grep -qx 'riscv64' \
+            || { echo "ERROR: image is not riscv64"; exit 1; }
+
+          "${RUN[@]}" --entrypoint /wrap/node "$IMG" /usr/local/lib/node_modules/n8n/bin/n8n --version \
+            | tee /dev/stderr | grep -qx "${{ env.VERSION }}"
+
+          # Every compiled addon must load
+          "${RUN[@]}" --entrypoint sh "$IMG" -c \
+            'cd /usr/local/lib/node_modules/n8n && node -e "for (const m of [\"sqlite3\", \"isolated-vm\", \"@confluentinc/kafka-javascript\", \"@parcel/watcher\"]) { require(m); console.log(m, \"ok\") }"'
+
+          # ... and be a RISC-V ELF file
+          docker create --platform linux/riscv64 --name extract "$IMG"
+          for m in sqlite3/build/Release/node_sqlite3.node \
+                   isolated-vm/build/Release/isolated_vm.node \
+                   @confluentinc/kafka-javascript/build/Release/confluent-kafka-javascript.node \
+                   @confluentinc/kafka-javascript/build/deps/librdkafka.so.1 \
+                   @parcel/watcher/build/Release/watcher.node; do
+            docker cp "extract:/usr/local/lib/node_modules/n8n/node_modules/$m" ./addon.bin
+            file ./addon.bin
+            file ./addon.bin | grep -q "RISC-V" || { echo "ERROR: $m is not a RISC-V binary"; exit 1; }
+          done
+          docker rm extract
+
+      # Runs a workflow with a Code node: it goes through the JS task runner, a separate Node process.
+      - name: Smoke test (execute workflow)
+        if: steps.probe.outputs.start_tests == 'true'
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64"
+          docker run --rm --platform linux/riscv64 \
+            -v "$RUNNER_TEMP/wrap:/wrap:ro" -v "$PWD/smoke:/smoke:ro" \
+            -e "PATH=/wrap:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            -e N8N_DIAGNOSTICS_ENABLED=false -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
+            --entrypoint sh "$IMG" -c '
+              N=/usr/local/lib/node_modules/n8n/bin/n8n
+              node $N import:workflow --input=/smoke/workflow.json
+              node $N execute --id=smoke1' | tee workflow.log
+          grep -q '"sum": 6' workflow.log || { echo "ERROR: Code node did not return the expected result"; exit 1; }
+
+      - name: Smoke test (start n8n)
+        if: steps.probe.outputs.start_tests == 'true'
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64"
+          docker run -d --name n8n-smoke --platform linux/riscv64 -p 5678:5678 \
+            -v "$RUNNER_TEMP/wrap:/wrap:ro" \
+            -e "PATH=/wrap:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            -e N8N_DIAGNOSTICS_ENABLED=false -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
+            --entrypoint /wrap/node "$IMG" /usr/local/lib/node_modules/n8n/bin/n8n
+
+          # First start under QEMU runs all database migrations, which is slow.
+          # /healthz answers before the migrations are done, so wait for the editor line.
+          for i in $(seq 1 100); do
+            if docker logs n8n-smoke 2>&1 | grep -q 'Editor is now accessible' \
+               && curl -fsS -o /dev/null http://127.0.0.1:5678/healthz/readiness; then
+              echo "n8n is ready after ~$((i * 15))s"
+              docker logs n8n-smoke 2>&1 | grep -v -i migration | tail -n 20
+              docker rm -f n8n-smoke
+              exit 0
+            fi
+            docker ps -q --filter name=n8n-smoke | grep -q . || break
+            sleep 15
+          done
+          echo "ERROR: n8n did not become ready"
+          docker logs n8n-smoke 2>&1 | tail -n 100
+          exit 1
+
+      - name: Login to Docker Hub
+        if: vars.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to Docker Hub
+        if: vars.DOCKERHUB_USERNAME != ''
+        run: |
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
+            ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
+            ${{ env.DOCKERHUB_REPO }}:latest
+          docker push ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+          docker push ${{ env.DOCKERHUB_REPO }}:latest
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<EOF
+          [n8n ${VERSION}](https://github.com/n8n-io/n8n/releases/tag/n8n%40${VERSION}) for linux/riscv64.
+
+          Node.js: \`${NODE_VERSION}\` (unofficial riscv64 build), Debian trixie.
+          Native addons (\`sqlite3\`, \`isolated-vm\`) are compiled from source during the build.
+
+          **Docker image:**
+          \`\`\`bash
+          docker pull ${{ env.DOCKERHUB_REPO }}:${VERSION}
+          \`\`\`
+
+          Built from the published \`n8n\` npm package without patches.
+          EOF
+
+          gh release create "${VERSION}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --title "n8n ${VERSION} for RISC-V 64" \
+            --notes-file notes.md
