@@ -141,13 +141,26 @@ jobs:
         run: |
           IMG="${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64"
           FLAGS=""
+          FOUND=0
+          # A broken V8 under qemu can hang instead of crashing, so every attempt has a timeout.
           for candidate in "" "--no-sparkplug" "--jitless"; do
-            if docker run --rm --platform linux/riscv64 --entrypoint node "$IMG" $candidate \
+            echo "::group::probe node ${candidate:-<no flags>}"
+            if timeout -s KILL 180 docker run --name probe --platform linux/riscv64 --entrypoint node "$IMG" $candidate \
                 -e 'let s = 0; for (let i = 0; i < 3e6; i++) s += i % 7; process.exit(s > 0 ? 0 : 1)'; then
+              ok=1
+            else
+              ok=0
+              echo "probe failed or timed out (exit $?)"
+            fi
+            docker rm -f probe >/dev/null 2>&1 || true
+            echo "::endgroup::"
+            if [[ $ok == 1 ]]; then
               FLAGS="$candidate"
+              FOUND=1
               break
             fi
           done
+          [[ $FOUND == 1 ]] || { echo "::error::Node does not run under this emulator in any mode"; exit 1; }
           [[ -n "$FLAGS" ]] && echo "::warning::Node needs '${FLAGS}' under this emulator"
 
           mkdir -p "$RUNNER_TEMP/wrap"
