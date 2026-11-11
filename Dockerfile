@@ -117,10 +117,21 @@ ENV NODE_ENV=production \
     N8N_RELEASE_TYPE=stable \
     SHELL=/bin/sh \
     NODE_PATH=/usr/local/lib/node_modules \
-    MAGICK_CODER_STABILITY=PRIMARY
+    MAGICK_CODER_STABILITY=PRIMARY \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 COPY --from=builder /usr/local /usr/local
 COPY docker-entrypoint.sh /docker-entrypoint.sh
+
+# This Node.js build segfaults at startup in V8's Sparkplug baseline compiler (exit 139, no
+# output): seen under qemu-user and on real riscv64 hardware. --no-sparkplug fixes it, but V8
+# flags other than a short list cannot go through NODE_OPTIONS. So a wrapper sits ahead of the
+# real binary in PATH: n8n's `#!/usr/bin/env node` shebang and the task runner's spawn('node')
+# both resolve through PATH, so the main process and the runner get the flag. The real binary
+# stays in /usr/local/bin because n8n derives the npm location from process.execPath.
+RUN printf '#!/bin/sh\nexec /usr/local/bin/node --no-sparkplug "$@"\n' > /usr/local/sbin/node \
+    && chmod +x /usr/local/sbin/node \
+    && node -v
 
 WORKDIR /home/node
 RUN mkdir -p /home/node/.n8n && chown -R node:node /home/node

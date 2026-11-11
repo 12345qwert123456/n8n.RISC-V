@@ -133,9 +133,11 @@ jobs:
           cache-to: type=gha,mode=max,scope=n8n
 
       # Node 24's V8 can crash under qemu-user (QEMU 11.1.2: its Sparkplug baseline compiler
-      # segfaults, `node -e 1` dies). Probe which flags the emulator needs and run every Node
-      # process of the tests through a wrapper that adds them. --jitless is the last resort and
-      # also disables WebAssembly, which n8n needs at startup, so the start tests are skipped then.
+      # segfaults, `node -e 1` dies), and the same crash happens on real riscv64 hardware. The
+      # image therefore ships /usr/local/sbin/node, a wrapper that adds --no-sparkplug, and the
+      # probe runs the image's own `node` (through PATH, as in production). If that still dies,
+      # --jitless is added on top as a last resort for the emulator; it also disables
+      # WebAssembly, which n8n needs at startup, so the start tests are skipped then.
       - name: Probe Node under emulation
         id: probe
         run: |
@@ -143,7 +145,7 @@ jobs:
           FLAGS=""
           FOUND=0
           # A broken V8 under qemu can hang instead of crashing, so every attempt has a timeout.
-          for candidate in "" "--no-sparkplug" "--jitless"; do
+          for candidate in "" "--jitless"; do
             echo "::group::probe node ${candidate:-<no flags>}"
             if timeout -s KILL 180 docker run --name probe --platform linux/riscv64 --entrypoint node "$IMG" $candidate \
                 -e 'let s = 0; for (let i = 0; i < 3e6; i++) s += i % 7; process.exit(s > 0 ? 0 : 1)'; then
@@ -161,10 +163,11 @@ jobs:
             fi
           done
           [[ $FOUND == 1 ]] || { echo "::error::Node does not run under this emulator in any mode"; exit 1; }
-          [[ -n "$FLAGS" ]] && echo "::warning::Node needs '${FLAGS}' under this emulator"
+          [[ -n "$FLAGS" ]] && echo "::warning::Node needs '${FLAGS}' on top of --no-sparkplug under this emulator"
 
+          # Extra emulator-only flags go in front of the image's own wrapper (which adds --no-sparkplug).
           mkdir -p "$RUNNER_TEMP/wrap"
-          printf '#!/bin/sh\nexec /usr/local/bin/node %s "$@"\n' "$FLAGS" > "$RUNNER_TEMP/wrap/node"
+          printf '#!/bin/sh\nexec /usr/local/sbin/node %s "$@"\n' "$FLAGS" > "$RUNNER_TEMP/wrap/node"
           chmod +x "$RUNNER_TEMP/wrap/node"
           echo "flags=${FLAGS}" >> "$GITHUB_OUTPUT"
           echo "start_tests=$([[ "$FLAGS" == "--jitless" ]] && echo false || echo true)" >> "$GITHUB_OUTPUT"
@@ -274,7 +277,14 @@ jobs:
           Built from the published \`n8n\` npm package without patches.
           EOF
 
-          gh release create "${VERSION}-riscv64" \
-            --repo "${{ github.repository }}" \
-            --title "n8n ${VERSION} for RISC-V 64" \
-            --notes-file notes.md
+          # A forced rebuild of an already released version only refreshes the notes.
+          if gh release view "${VERSION}-riscv64" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release edit "${VERSION}-riscv64" \
+              --repo "${{ github.repository }}" \
+              --notes-file notes.md
+          else
+            gh release create "${VERSION}-riscv64" \
+              --repo "${{ github.repository }}" \
+              --title "n8n ${VERSION} for RISC-V 64" \
+              --notes-file notes.md
+          fi

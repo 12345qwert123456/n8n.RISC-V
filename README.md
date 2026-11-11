@@ -49,7 +49,7 @@ A daily workflow checks `npm`'s `latest` for `n8n`. If no release `<version>-ris
 
 Smoke tests: image architecture, `n8n --version`, all compiled addons load and are RISC-V ELF files, a workflow with a Code node (JS task runner) runs and returns the expected result, and a real container reaches `/healthz/readiness`.
 
-Node 24's V8 can crash under some qemu-user versions: with QEMU 11.1.2 its Sparkplug baseline compiler segfaults (`node -e 1` dies, even `npm` does). The workflow probes the emulator and runs every Node process of the tests through a wrapper that adds `--no-sparkplug` when needed. `--jitless` is the last resort; it disables WebAssembly, which n8n needs at startup, so the start tests are skipped then. None of this affects the image: on real riscv64 hardware Node runs normally.
+Node 24's V8 (this unofficial riscv64 build) segfaults at startup in its Sparkplug baseline compiler: seen under qemu-user (QEMU 11.1.2: `node -e 1` dies, even `npm` does) and on real riscv64 hardware (container exits with 139 and no output). The image therefore puts a small wrapper `/usr/local/sbin/node` ahead of the real binary in `PATH` that adds `--no-sparkplug`. This covers n8n itself (`#!/usr/bin/env node`) and the task runner (`spawn('node')`). The flag cannot go through `NODE_OPTIONS`, V8 only allows a short list there. In CI the workflow additionally probes whether the emulator needs `--jitless`; that disables WebAssembly, which n8n needs at startup, so the start tests are skipped then. Processes started through `process.execPath` (npm for community packages) bypass the wrapper.
 
 ## Why not upstream
 
