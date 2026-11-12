@@ -35,7 +35,10 @@ ARG BUILD_NODE_OPTIONS="--max-old-space-size=4096 --jitless"
 
 RUN apk add --no-cache \
         nodejs nodejs-dev npm build-base python3 py3-setuptools git bash perl linux-headers pkgconf \
-        openssl-dev cyrus-sasl-dev zstd-dev lz4-dev curl-dev zlib-dev
+        openssl-dev cyrus-sasl-dev zstd-dev lz4-dev curl-dev zlib-dev \
+        ada-dev simdjson-dev simdutf-dev sqlite-dev icu-dev
+# The last line: Alpine builds Node.js against shared system libraries and the headers in
+# nodejs-dev make every addon link with them (-lada -lsimdjson -lsimdutf -lsqlite3 -licuuc ...).
 
 # nodedir: node-gyp uses the headers from nodejs-dev (/usr/include/node), no download needed.
 # CKJS_LINKING=dynamic makes @confluentinc/kafka-javascript use the system libssl/zlib/zstd.
