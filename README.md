@@ -71,7 +71,7 @@ On a riscv64 machine, or on any host with QEMU user emulation (`qemu-user-static
 
 ```bash
 docker buildx build --platform linux/riscv64 --load \
-  --build-arg N8N_VERSION=2.46.7 --build-arg NODE_VERSION=24.22.2 \
+  --build-arg N8N_VERSION=2.46.7 \
   -t n8n:riscv64 .
 ```
 
