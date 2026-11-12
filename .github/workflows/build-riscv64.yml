@@ -17,6 +17,10 @@ on:
         description: 'Runner label for the build job (a self-hosted riscv64 label builds natively)'
         type: string
         default: 'ubuntu-latest'
+      alpine:
+        description: 'Build the Alpine variant (Dockerfile.alpine). Pushes only <version>-alpine, no latest tag, no release.'
+        type: boolean
+        default: false
 
 env:
   IMAGE_NAME: n8n
@@ -121,7 +125,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: ${{ inputs.alpine && 'Dockerfile.alpine' || 'Dockerfile' }}
           platforms: linux/riscv64
           load: true
           tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64
@@ -129,8 +133,8 @@ jobs:
             N8N_VERSION=${{ env.VERSION }}
             NODE_VERSION=${{ env.NODE_VERSION }}
             NODE_MAJOR=${{ env.NODE_MAJOR }}
-          cache-from: type=gha,scope=n8n
-          cache-to: type=gha,mode=max,scope=n8n
+          cache-from: type=gha,scope=${{ inputs.alpine && 'n8n-alpine' || 'n8n' }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.alpine && 'n8n-alpine' || 'n8n' }}
 
       # Node 24's V8 can crash under qemu-user (QEMU 11.1.2: its Sparkplug baseline compiler
       # segfaults, `node -e 1` dies), and the same crash happens on real riscv64 hardware. The
@@ -252,14 +256,22 @@ jobs:
       - name: Push to Docker Hub
         if: vars.DOCKERHUB_USERNAME != ''
         run: |
-          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
-            ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
-          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
-            ${{ env.DOCKERHUB_REPO }}:latest
-          docker push ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
-          docker push ${{ env.DOCKERHUB_REPO }}:latest
+          if [[ "${{ inputs.alpine }}" == "true" ]]; then
+            # The Alpine variant is experimental: its own tag only, never `latest`.
+            docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
+              ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}-alpine
+            docker push ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}-alpine
+          else
+            docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
+              ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+            docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
+              ${{ env.DOCKERHUB_REPO }}:latest
+            docker push ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+            docker push ${{ env.DOCKERHUB_REPO }}:latest
+          fi
 
       - name: Create GitHub Release
+        if: ${{ !inputs.alpine }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

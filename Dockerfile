@@ -129,7 +129,10 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
 # real binary in PATH: n8n's `#!/usr/bin/env node` shebang and the task runner's spawn('node')
 # both resolve through PATH, so the main process and the runner get the flag. The real binary
 # stays in /usr/local/bin because n8n derives the npm location from process.execPath.
-RUN printf '#!/bin/sh\nexec /usr/local/bin/node --no-sparkplug "$@"\n' > /usr/local/sbin/node \
+#   --disable-wasm-trap-handler: V8 otherwise reserves ~10 GiB of address space per WebAssembly
+#   memory; boards with Sv39 (SpacemiT K1 and most others) have 256 GiB in total, so n8n runs
+#   out ("Cannot allocate Wasm memory") and crashes with SIGSEGV.
+RUN printf '#!/bin/sh\nexec /usr/local/bin/node --no-sparkplug --disable-wasm-trap-handler "$@"\n' > /usr/local/sbin/node \
     && chmod +x /usr/local/sbin/node \
     && node -v
 
