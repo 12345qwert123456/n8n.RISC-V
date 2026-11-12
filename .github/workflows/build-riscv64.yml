@@ -17,10 +17,6 @@ on:
         description: 'Runner label for the build job (a self-hosted riscv64 label builds natively)'
         type: string
         default: 'ubuntu-latest'
-      alpine:
-        description: 'Build the Alpine variant (Dockerfile.alpine). Pushes only <version>-alpine, no latest tag, no release.'
-        type: boolean
-        default: false
 
 env:
   IMAGE_NAME: n8n
@@ -34,7 +30,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.resolve.outputs.version }}
-      node_version: ${{ steps.resolve.outputs.node_version }}
       node_major: ${{ steps.resolve.outputs.node_major }}
       should_build: ${{ steps.check.outputs.should_build }}
     steps:
@@ -58,17 +53,9 @@ jobs:
           MAJOR=$(echo "$ENGINES" | grep -oE '[0-9]+' | head -n1)
           [[ -n "$MAJOR" ]] || { echo "ERROR: cannot read Node major from engines '${ENGINES}'"; exit 1; }
 
-          # docker.io/node has no riscv64 variant; unofficial-builds does. Index is newest first.
-          NODE=$(curl -sfL --retry 3 https://unofficial-builds.nodejs.org/download/release/index.json \
-            | jq -r --arg m "v${MAJOR}." \
-              '[.[] | select(.files | index("linux-riscv64")) | select(.version | startswith($m))][0].version')
-          NODE="${NODE#v}"
-          [[ -n "$NODE" && "$NODE" != "null" ]] || { echo "ERROR: no riscv64 Node ${MAJOR}.x build found"; exit 1; }
-
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "node_version=${NODE}" >> "$GITHUB_OUTPUT"
           echo "node_major=${MAJOR}" >> "$GITHUB_OUTPUT"
-          echo "Resolved n8n ${VERSION} (engines ${ENGINES}), Node ${NODE}"
+          echo "Resolved n8n ${VERSION} (engines ${ENGINES})"
 
       - name: Check if already built
         id: check
@@ -103,7 +90,6 @@ jobs:
     timeout-minutes: 360
     env:
       VERSION: ${{ needs.detect.outputs.version }}
-      NODE_VERSION: ${{ needs.detect.outputs.node_version }}
       NODE_MAJOR: ${{ needs.detect.outputs.node_major }}
 
     steps:
@@ -125,16 +111,15 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ inputs.alpine && 'Dockerfile.alpine' || 'Dockerfile' }}
+          file: Dockerfile
           platforms: linux/riscv64
           load: true
           tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64
           build-args: |
             N8N_VERSION=${{ env.VERSION }}
-            NODE_VERSION=${{ env.NODE_VERSION }}
             NODE_MAJOR=${{ env.NODE_MAJOR }}
-          cache-from: type=gha,scope=${{ inputs.alpine && 'n8n-alpine' || 'n8n' }}
-          cache-to: type=gha,mode=max,scope=${{ inputs.alpine && 'n8n-alpine' || 'n8n' }}
+          cache-from: type=gha,scope=n8n-alpine
+          cache-to: type=gha,mode=max,scope=n8n-alpine
 
       # Node 24's V8 can crash under qemu-user (QEMU 11.1.2: its Sparkplug baseline compiler
       # segfaults, `node -e 1` dies), and the same crash happens on real riscv64 hardware. The
@@ -256,29 +241,21 @@ jobs:
       - name: Push to Docker Hub
         if: vars.DOCKERHUB_USERNAME != ''
         run: |
-          if [[ "${{ inputs.alpine }}" == "true" ]]; then
-            # The Alpine variant is experimental: its own tag only, never `latest`.
-            docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
-              ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}-alpine
-            docker push ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}-alpine
-          else
-            docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
-              ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
-            docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
-              ${{ env.DOCKERHUB_REPO }}:latest
-            docker push ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
-            docker push ${{ env.DOCKERHUB_REPO }}:latest
-          fi
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
+            ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
+            ${{ env.DOCKERHUB_REPO }}:latest
+          docker push ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+          docker push ${{ env.DOCKERHUB_REPO }}:latest
 
       - name: Create GitHub Release
-        if: ${{ !inputs.alpine }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > notes.md <<EOF
           [n8n ${VERSION}](https://github.com/n8n-io/n8n/releases/tag/n8n%40${VERSION}) for linux/riscv64.
 
-          Node.js: \`${NODE_VERSION}\` (unofficial riscv64 build), Debian trixie.
+          Alpine Linux, Node.js from Alpine's own package.
           Native addons (\`sqlite3\`, \`isolated-vm\`) are compiled from source during the build.
 
           **Docker image:**
